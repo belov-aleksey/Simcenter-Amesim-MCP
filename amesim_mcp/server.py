@@ -1,38 +1,26 @@
 """MCP Server for Siemens Simcenter Amesim system-level simulation."""
 
 import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+from mcp.types import ToolAnnotations
 
 from mcp.server.fastmcp import FastMCP
 
 from . import amesim_api as _api
 
-mcp = FastMCP(
-    "Simcenter Amesim",
-    instructions=(
-        "MCP server for building and running Simcenter Amesim circuits via the Circuit API. "
-        "Typical workflow: connect → create_circuit → add_component → change_submodel → "
-        "connect_two_ports → set_parameter_value → generate_code → run_simulation → "
-        "get_variable_values → save_circuit. "
-        "Positions are (x, y) integer sketch coordinates, ports are 0-based indices "
-        "(port index = port number shown in the GUI, minus 1). "
-        "If a named tool raises AttributeError or you need a function with no dedicated tool "
-        "(e.g. AMEAddGlobalParameter, AMEGetCompilers, Design Exploration/Study APIs), use "
-        "execute_python — it has ame_apy and amesim pre-imported, and you can call "
-        "execute_python(\"help(ame_apy.SOME_FUNCTION)\") or "
-        "execute_python(\"print([n for n in dir(ame_apy) if 'Save' in n])\") to discover the "
-        "exact, version-correct signature live from the installed Amesim, exactly as the "
-        "official docs recommend. "
-        "AMEInitAPI checks out one Amesim license token for the whole session — call disconnect() "
-        "when done so it doesn't block the user's own interactive Amesim usage."
-    ),
-)
+READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+RISK = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+mcp = FastMCP("Simcenter Amesim", instructions="Call connect first; use get_api_help for installed API signatures. Disconnect when finished to release the license. Ports are zero-based. execute_python is disabled by default.")
 
 ame = _api.AmesimConnection()
 
 
 # ---------- Power tools ----------
 
-@mcp.tool()
 def execute_python(code: str) -> str:
     """Execute Python code in the live Amesim worker process (persistent namespace).
 
@@ -40,7 +28,8 @@ def execute_python(code: str) -> str:
       ame_apy — the Circuit API module      amesim — the Simulation Scripting module
     Use this for anything with no dedicated tool, or to discover a function's exact
     signature with help(ame_apy.SOME_FUNCTION) before calling it.
-    Returns captured stdout (print your results!) or a traceback on error.
+    Requires explicit enablement and client approval. Output is limited to 65536
+    characters; a 30-second timeout terminates the worker and loses unsaved state.
     """
     if not ame.is_connected():
         ame.connect()
@@ -49,27 +38,27 @@ def execute_python(code: str) -> str:
 
 # ---------- Connection ----------
 
-@mcp.tool()
-def connect(version: str = "2021.1") -> str:
+@mcp.tool(annotations=WRITE)
+def connect(version: str = "2404") -> dict:
     """Connect to Simcenter Amesim. Starts a background worker process if none is running.
     Each worker serves exactly one session — calling connect() again while already
     connected is a no-op; call disconnect() first to switch versions or restart.
 
     Args:
-        version: Installed Amesim version to use — "2021.1" (default) or "2404".
+        version: Installed Amesim version to use — "2404" (default).
     """
     if ame.is_connected():
-        return "Already connected. Call disconnect() first if you need to restart or switch versions."
+        return {"connected": True, "version": ame._version}
     return ame.connect(version=version)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def disconnect() -> str:
     """Release the Amesim license token and stop the background worker process."""
     return ame.disconnect()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def status() -> str:
     """Check connection status and the Circuit API version."""
     if not ame.is_connected():
@@ -83,36 +72,52 @@ def status() -> str:
 
 # ---------- Circuit lifecycle ----------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_circuit(name: str) -> str:
     """Create a new, empty Amesim circuit (.ame file) and make it active.
 
     Args:
         name: Name for the new circuit (no extension), e.g. "FlatTwin".
     """
-    ame.api.AMECreateCircuit(name)
+    from pathlib import Path
+    target = Path(name).expanduser().resolve()
+    if target.with_suffix(".ame").exists():
+        raise FileExistsError(str(target))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ame.api.AMECreateCircuit(target.stem, str(target.parent))
     return f"Created circuit '{name}'."
 
 
-@mcp.tool()
-def open_ame_file(path: str) -> str:
-    """Open an existing .ame circuit file and make it active.
+@mcp.tool(annotations=WRITE)
+def open_ame_file(path: str, fresh: bool = False) -> dict:
+    """Open a .ame circuit. fresh=True isolates the archive from stale expanded files.
 
     Args:
-        path: Path to the .ame file (absolute, or relative to the worker's working directory).
+        path: Path to the .ame archive.
+        fresh: Copy the archive into a new temporary directory before opening. Changes
+               to that circuit are saved in the copy; use save_circuit_as to keep them.
     """
-    ame.api.AMEOpenAmeFile(path)
-    return f"Opened '{path}'."
+    source = Path(path).expanduser().resolve()
+    if source.suffix.lower() != ".ame" or not source.is_file():
+        raise FileNotFoundError("Expected an existing .ame archive: " + str(source))
+    target = source
+    if fresh:
+        from .amesim_api import STATE
+        workspace = Path(tempfile.mkdtemp(prefix="opened-", dir=STATE))
+        target = workspace / source.name
+        shutil.copy2(source, target)
+    ame.api.AMEOpenAmeFile(str(target))
+    return {"opened": str(target), "source": str(source), "isolated": fresh}
 
 
-@mcp.tool()
+@mcp.tool(annotations=RISK)
 def save_circuit() -> str:
     """Save the active circuit."""
     ame.api.AMESaveCircuit()
     return "Circuit saved."
 
 
-@mcp.tool()
+@mcp.tool(annotations=RISK)
 def close_circuit(save: bool = True) -> str:
     """Close the active circuit.
 
@@ -125,7 +130,7 @@ def close_circuit(save: bool = True) -> str:
 
 # ---------- Building / editing ----------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def add_component(icon_name: str, alias: str, x: int = 0, y: int = 0) -> str:
     """Add a component to the sketch of the active circuit.
 
@@ -139,7 +144,7 @@ def add_component(icon_name: str, alias: str, x: int = 0, y: int = 0) -> str:
     return f"Added component '{icon_name}' as '{alias}' at ({x}, {y})."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def move_component(alias: str, x: int, y: int) -> str:
     """Move a component to a new position. Connected lines are not moved with it.
 
@@ -152,7 +157,7 @@ def move_component(alias: str, x: int, y: int) -> str:
     return f"Moved '{alias}' to ({x}, {y})."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def rotate_component(alias: str, quarter_turns: int = 1) -> str:
     """Rotate a component's icon by -90 degrees, one or more times.
 
@@ -164,7 +169,7 @@ def rotate_component(alias: str, quarter_turns: int = 1) -> str:
     return f"Rotated '{alias}' by {quarter_turns} x -90 degrees."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def flip_component(alias: str) -> str:
     """Flip a component (mirror it) in the sketch.
 
@@ -175,7 +180,19 @@ def flip_component(alias: str) -> str:
     return f"Flipped '{alias}'."
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
+def get_component_geometry(alias: str) -> dict:
+    """Read a component's position, size and port coordinates in sketch pixels."""
+    return {"alias": alias, "geometry": ame.api.AMEGetComponentGeometry(alias)}
+
+
+@mcp.tool(annotations=READ)
+def get_component_transformation(alias: str) -> dict:
+    """Read a component icon's quarter-turn count and mirror state."""
+    return {"alias": alias, "transformation": ame.api.AMEGetComponentIconTransformation(alias)}
+
+
+@mcp.tool(annotations=RISK)
 def remove_component(alias: str) -> str:
     """Remove a component from the active circuit.
 
@@ -186,21 +203,40 @@ def remove_component(alias: str) -> str:
     return f"Removed component '{alias}'."
 
 
-@mcp.tool()
-def connect_two_ports(alias1: str, port1: int, alias2: str, port2: int) -> str:
-    """Connect a port of one component/line to a port of another with a line.
+@mcp.tool(annotations=WRITE)
+def connect_two_ports(alias1: str, port1: int, alias2: str, port2: int, line_alias: str,
+                      bend_points: list[list[int]] | None = None) -> str:
+    """Connect two ports with a visible sketch line. Supply a unique line alias.
 
     Args:
         alias1: Alias path of the first component.
         port1: Port index (0-based) on the first component.
         alias2: Alias path of the second component.
         port2: Port index (0-based) on the second component.
+        line_alias: Unique alias for the visible line, e.g. "source_to_force".
+        bend_points: Optional sketch coordinates between the ports, for right-angle routing.
     """
-    result = ame.api.AMEConnectTwoPorts(alias1, port1, alias2, port2)
-    return f"Connected {alias1}[{port1}] -- {alias2}[{port2}] (line: {result})."
+    if not line_alias.strip():
+        raise ValueError("line_alias must not be empty")
+    if bend_points is not None:
+        if len(bend_points) > 32 or any(len(point) != 2 or
+                                        any(type(value) is not int for value in point)
+                                        for point in bend_points):
+            raise ValueError("bend_points must contain at most 32 integer (x, y) pairs")
+        result = ame.api.AMEConnectTwoPortsWithLine(alias1, port1, alias2, port2,
+                                                     line_alias, bend_points)
+    else:
+        result = ame.api.AMEConnectTwoPortsWithLine(alias1, port1, alias2, port2, line_alias)
+    return f"Connected {alias1}[{port1}] -- {alias2}[{port2}] with visible line '{line_alias}' ({result})."
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
+def get_line_geometry(line_alias: str) -> dict:
+    """Read endpoint and bend coordinates of a visible sketch line."""
+    return {"line_alias": line_alias, "geometry": ame.api.AMEGetLineGeometry(line_alias)}
+
+
+@mcp.tool(annotations=RISK)
 def remove_line(alias: str) -> str:
     """Remove a connection line from the active circuit.
 
@@ -211,7 +247,7 @@ def remove_line(alias: str) -> str:
     return f"Removed line '{alias}'."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def create_supercomponent(
     component_aliases: str,
     submodel_name: str,
@@ -237,7 +273,7 @@ def create_supercomponent(
 
 # ---------- Submodels ----------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def change_submodel(alias: str, submodel_name: str, submodel_path: str = "") -> str:
     """Assign a submodel to a component or line.
 
@@ -257,7 +293,7 @@ def change_submodel(alias: str, submodel_name: str, submodel_path: str = "") -> 
 
 # ---------- Parameters ----------
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_parameter_value(data_path: str) -> str:
     """Get the current value (and unit) of a parameter or state variable.
 
@@ -268,7 +304,7 @@ def get_parameter_value(data_path: str) -> str:
     return json.dumps({"value": value, "unit": unit})
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def set_parameter_value(data_path: str, value: str) -> str:
     """Set the value of a parameter or the initial value of a state.
 
@@ -280,7 +316,7 @@ def set_parameter_value(data_path: str, value: str) -> str:
     return f"Set {data_path} = {value}."
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_parameter_infos(data_path: str) -> str:
     """Get the type, title and unit of a parameter.
 
@@ -293,7 +329,7 @@ def get_parameter_infos(data_path: str) -> str:
 
 # ---------- Compile & run ----------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def generate_code() -> str:
     """Compile the active circuit. Required before running a simulation, and after any
     structural change (components, connections, submodels)."""
@@ -301,7 +337,7 @@ def generate_code() -> str:
     return "Code generated (compiled)."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def set_run_parameter(name: str, value: str) -> str:
     """Set a run/simulation parameter of the active circuit.
 
@@ -310,24 +346,30 @@ def set_run_parameter(name: str, value: str) -> str:
               (floats, as strings), "integ_method" ("0" standard / "1" fixed step),
               "tolerance" (float string, standard integrator only), "simulation_mode"
               ("1" stabilizing / "2" dynamic / "3" both). For the full list, use
-              execute_python("help(ame_apy.AMESetRunParameter)").
+              get_api_help("AMESetRunParameter").
         value: New value as a string, e.g. "0.1".
     """
     ame.api.AMESetRunParameter(name, value)
     return f"Set run parameter {name} = {value}."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def run_simulation() -> str:
     """Run a (temporal) simulation of the active circuit. Compile with generate_code() first,
     and again after any structural change, to make sure the run uses up-to-date code."""
-    ame.api.AMERunSimulation()
+    try:
+        ame.api.AMERunSimulation()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc}. If this archive was opened beside pre-existing expanded Amesim files, "
+            "reopen it with open_ame_file(fresh=True) and retry; this keeps the original files intact."
+        ) from exc
     return "Simulation run complete."
 
 
 # ---------- Results ----------
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_variable_values(data_path: str) -> str:
     """Get the time-series values of a saved variable from the last simulation run.
     Returns a JSON array of [time, value] pairs.
@@ -339,7 +381,7 @@ def get_variable_values(data_path: str) -> str:
     return json.dumps(values)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 def get_variable_infos(data_path: str) -> str:
     """Get metadata (type, title, unit) about a variable.
 
@@ -350,8 +392,44 @@ def get_variable_infos(data_path: str) -> str:
     return json.dumps(infos)
 
 
+@mcp.tool(annotations=READ)
+def get_api_help(function_name: str) -> dict:
+    """Read installed API documentation without arbitrary code execution."""
+    return {"documentation": ame.request("help", name=function_name)}
+
+
+@mcp.tool(annotations=WRITE)
+def doctor(deep: bool = False) -> dict:
+    """Check installation; deep=True temporarily checks out a license and tests the worker."""
+    from .doctor import diagnose
+    return diagnose(deep)
+
+
+@mcp.tool(annotations=WRITE)
+def save_circuit_as(path: str) -> dict:
+    """Save to a new .ame path. Refuses to overwrite existing files."""
+    from .results import new_path
+    target = new_path(path, ".ame")
+    ame.api.AMESaveCircuitAs(target.stem, str(target.parent), False)
+    return {"path": str(target)}
+
+
+@mcp.tool(annotations=WRITE)
+def export_results_csv(data_paths: list[str], output_path: str) -> dict:
+    """Export aligned time series into a NEW CSV and a JSON summary."""
+    from .results import export
+    return export(ame, data_paths, output_path)
+
+
+if os.environ.get("AMESIM_MCP_ENABLE_EXECUTE_PYTHON") == "1":
+    mcp.tool(annotations=RISK)(execute_python)
+
+
 def main():
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        ame.disconnect()
 
 
 if __name__ == "__main__":

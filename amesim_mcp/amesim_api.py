@@ -1,232 +1,195 @@
-"""Wrapper around the Simcenter Amesim Circuit API, bridged over RPyC.
-
-Two reasons this isn't a direct in-process import of ame_apy/amesim:
-
-1. AMEPython.exe (the launcher that makes `ame_apy`/`amesim` importable) prints
-   an unconditional "Starting Python ..." banner to stdout with no way to
-   silence it. If used as the MCP server's own stdio child process, that
-   banner would corrupt the JSON-RPC stream Claude Desktop expects.
-2. AMERunSimulation (and likely other run-management calls) hangs forever when
-   invoked from anything but the process's main thread — verified: the exact
-   same compiled model runs instantly from a plain console, but hangs when
-   called through rpyc's ThreadedServer (which services each connection on
-   its own background thread). Siemens' own scripting/python/serve_api.py
-   uses ThreadedServer, so it can't be used as-is either.
-
-So instead we spawn AMEPython.exe as a separate background "worker" process
-running our own worker_entry.py (an RPyC OneShotServer — single connection,
-served synchronously on the main thread), and this module talks to it as an
-ordinary RPyC client over a local TCP port. The worker's stdout/stderr
-(banner included) is redirected to a log file and never touches our own
-stdio.
-"""
-
+"""Owned, authenticated Amesim worker connection."""
+import atexit
+import json
+import hashlib
+import hmac
 import os
+from pathlib import Path
+import secrets
 import subprocess
 import time
+import threading
+from functools import wraps
 import winreg
+import rpyc
 
-import rpyc.utils.classic as rpyc_classic
-
-# Machine-level env vars the worker needs that Claude Desktop's own process may be
-# missing (env var changes don't propagate to already-running processes on Windows,
-# and Claude Desktop is a long-lived background app — it can easily predate these
-# being set). Read fresh from the registry instead of trusting inherited os.environ.
-_MACHINE_ENV_FALLBACKS = ["LMS_LICENSE", "SC1D_LICENSING_TYPE"]
+DEFAULT_VERSION = "2404"
+ROOT = Path(__file__).resolve().parent.parent
+STATE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "amesim-mcp"
 
 
-def _read_machine_env_var(name):
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-        ) as key:
-            value, _ = winreg.QueryValueEx(key, name)
-            return value
-    except OSError:
-        return None
+def synchronized(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
-VERSION_DIRS = {
-    "2021.1": r"C:\Program Files\Simcenter\2021.1\Amesim",
-    "2404": r"C:\Program Files\Simcenter\2404\Amesim",
-}
-DEFAULT_VERSION = "2021.1"
-DEFAULT_PORT = 18861
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_VENDOR_DIR = os.path.join(_PROJECT_ROOT, "vendor")
-_WORKER_LOG = os.path.join(_PROJECT_ROOT, "amesim_worker.log")
+def registry_env(name):
+    for hive, key in [(winreg.HKEY_CURRENT_USER, "Environment"),
+                      (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")]:
+        try:
+            with winreg.OpenKey(hive, key) as handle:
+                return winreg.QueryValueEx(handle, name)[0]
+        except OSError:
+            pass
+    return None
 
-# Executed once (remotely) right after connecting, so execute_python() gets a
-# persistent namespace with ame_apy/amesim pre-imported and output capture,
-# mirroring inventor-mcp's execute_python but running in the worker process.
-_REMOTE_BOOTSTRAP = r"""
-import io as __mcp_io, contextlib as __mcp_contextlib, traceback as __mcp_traceback
-import ame_apy, amesim
 
-def __mcp_exec(_mcp_code):
-    buf = __mcp_io.StringIO()
-    try:
-        with __mcp_contextlib.redirect_stdout(buf):
-            exec(compile(_mcp_code, "<mcp>", "exec"), globals())
-        out = buf.getvalue().strip()
-        return out if out else "(ok, no output)"
-    except Exception:
-        partial = buf.getvalue().strip()
-        tb = __mcp_traceback.format_exc(limit=3)
-        return (partial + "\n" if partial else "") + "ERROR:\n" + tb
-"""
+def discover_home(version=DEFAULT_VERSION):
+    explicit = os.environ.get("AMESIM_HOME")
+    candidates = [Path(explicit)] if explicit else []
+    if not explicit:
+        if os.environ.get("AME"):
+            candidates.append(Path(os.environ["AME"]))
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for base in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+                try:
+                    with winreg.OpenKey(hive, base) as root:
+                        for i in range(winreg.QueryInfoKey(root)[0]):
+                            try:
+                                with winreg.OpenKey(root, winreg.EnumKey(root, i)) as key:
+                                    name = winreg.QueryValueEx(key, "DisplayName")[0]
+                                    if "Simcenter" in name and version in name:
+                                        candidates.append(Path(winreg.QueryValueEx(key, "InstallLocation")[0]))
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+        for drive in ("C:", "D:", "E:"):
+            for folder in ("Program Files/Simcenter", "Program Files/Siemens/Simcenter", "Programs/Simcenter"):
+                candidates.append(Path(drive + "/") / folder / version)
+    for candidate in candidates:
+        for home in (candidate, candidate / "Amesim"):
+            if (home / "win64/AMEPython.exe").is_file():
+                return home.resolve()
+    raise FileNotFoundError("Amesim " + version + " not found. Set AMESIM_HOME to the directory containing win64/AMEPython.exe.")
+
+
+class ApiProxy:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        if not name.startswith("AME"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: self.connection.request("call", name=name, args=args, kwargs=kwargs)
 
 
 class AmesimConnection:
     def __init__(self):
-        self._conn = None
-        self._worker_proc = None
-        self._version = None
-        self._port = None
+        self._lock = threading.RLock()
+        self._conn = self._worker_proc = self._log = None
+        self._version = self._port = None
+        self._token = None
+        atexit.register(self.disconnect)
 
     @property
     def api(self):
-        """The remote `ame_apy` module (Circuit API) — raises if not connected."""
         if self._conn is None:
-            raise RuntimeError("Not connected to Simcenter Amesim. Call connect() first.")
-        return self._conn.modules["ame_apy"]
+            raise RuntimeError("Not connected. Call connect() first.")
+        return ApiProxy(self)
 
-    @property
-    def amesim(self):
-        """The remote `amesim` module (Simulation Scripting helpers)."""
+    @synchronized
+    def request(self, operation, **payload):
         if self._conn is None:
-            raise RuntimeError("Not connected to Simcenter Amesim. Call connect() first.")
-        return self._conn.modules["amesim"]
-
-    # ---------- Connection ----------
-
-    def connect(self, version: str = DEFAULT_VERSION, port: int = DEFAULT_PORT) -> str:
-        if version not in VERSION_DIRS:
-            raise ValueError(
-                f"Unknown Amesim version '{version}'. Available: {', '.join(VERSION_DIRS)}"
-            )
-
-        attached = False
+            raise RuntimeError("Not connected. Call connect() first.")
         try:
-            conn = rpyc_classic.connect("localhost", port)
-            conn.ping()
-            attached = True
+            result = json.loads(self._conn.root.request(self._token, json.dumps(dict(operation=operation, **payload))))
         except Exception:
-            conn = None
+            self._cleanup()
+            raise RuntimeError("Worker communication failed or timed out; disconnected. See worker log.") from None
+        if not result["ok"]:
+            raise RuntimeError(result["error"])
+        return result.get("value")
 
-        if conn is None:
-            self._spawn_worker(version, port)
-            last_err = None
-            conn = None
-            for _ in range(40):
-                time.sleep(0.5)
-                try:
-                    conn = rpyc_classic.connect("localhost", port)
-                    conn.ping()
-                    break
-                except Exception as e:
-                    last_err = e
-                    conn = None
-            if conn is None:
-                raise RuntimeError(
-                    f"Started the Amesim worker but could not connect on port {port}: {last_err}"
-                )
-
-        conn._config["sync_request_timeout"] = 300  # compiling/running a model can be slow
-        self._conn = conn
-        self._version = version
-        self._port = port
-
+    @synchronized
+    def connect(self, version=DEFAULT_VERSION):
+        if self.is_connected():
+            return {"connected": True, "version": self._version}
+        home = discover_home(version)
+        logs = STATE / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        self._token = secrets.token_hex(32)
+        ready = logs / ("ready-" + secrets.token_hex(8) + ".json")
+        self.log_path = logs / ("worker-" + time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(4) + ".log")
+        env = os.environ.copy()
+        env.update(AME=str(home), AMESIM_MCP_TOKEN=self._token, AMESIM_MCP_OWNER_PID=str(os.getpid()))
+        for name in ("LMS_LICENSE", "SC1D_LICENSING_TYPE"):
+            if not env.get(name) and registry_env(name):
+                env[name] = registry_env(name)
+        env["PATH"] = os.pathsep.join([str(home), str(home / "win64"), str(home / "win32"), env.get("PATH", "")])
+        env["PYTHONPATH"] = str(ROOT / "vendor")
+        self._log = self.log_path.open("w", encoding="utf-8")
         try:
-            conn.execute(_REMOTE_BOOTSTRAP)
-        except Exception as e:
-            self._reset()
-            raise RuntimeError(f"Connected to worker but failed to load ame_apy/amesim: {e}")
-
-        init_note = ""
-        try:
-            conn.modules["ame_apy"].AMEInitAPI(False)
-        except Exception as e:
-            init_note = f" (AMEInitAPI warning — may already be initialized: {e})"
-
-        verb = "Attached to already-running" if attached else "Started"
-        return f"{verb} Amesim {version} worker on port {port}. Circuit API ready.{init_note}"
-
-    def is_connected(self) -> bool:
-        if self._conn is None:
-            return False
-        try:
-            self._conn.ping()
-            return True
+            self._worker_proc = subprocess.Popen(
+                [str(home / "win64/AMEPython.exe"), "-s", str(ROOT / "amesim_mcp/worker_entry.py"), str(ready)],
+                env=env, cwd=str(STATE), stdin=subprocess.DEVNULL, stdout=self._log, stderr=self._log,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            deadline = time.monotonic() + 45
+            while not ready.exists():
+                if self._worker_proc.poll() is not None or time.monotonic() > deadline:
+                    raise RuntimeError("Worker failed to start; inspect " + str(self.log_path))
+                time.sleep(0.1)
+            self._port = json.loads(ready.read_text())["port"]
+            self._conn = rpyc.connect("127.0.0.1", self._port,
+                config={"sync_request_timeout": 300, "allow_pickle": False})
+            challenge = secrets.token_hex(32)
+            identity = self.request("identity", challenge=challenge)
+            proof = hmac.new(self._token.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(identity["proof"], proof):
+                raise RuntimeError("Worker identity mismatch")
+            self.request("init")
+            api_version = self.api.AMEGetAPIVersion()
+            if str(api_version[-1]) != version:
+                raise RuntimeError("Requested Amesim " + version + " but installed API reports " + str(api_version))
+            self._version = version
+            return {"connected": True, "version": version, "api_version": api_version,
+                    "port": self._port, "log": str(self.log_path)}
         except Exception:
-            self._reset()
-            return False
+            self.disconnect()
+            raise
+        finally:
+            ready.unlink(missing_ok=True)
 
-    def disconnect(self) -> str:
-        if self._conn is None:
-            return "Not connected."
-        try:
+    def is_connected(self):
+        return self._conn is not None and self._worker_proc is not None and self._worker_proc.poll() is None
+
+    def _cleanup(self):
+        conn, self._conn = self._conn, None
+        if conn:
             try:
-                self._conn.modules["ame_apy"].AMECloseAPI()
+                conn.close()
             except Exception:
                 pass
-            self._conn.close()
-        finally:
-            if self._worker_proc is not None:
-                try:
-                    self._worker_proc.terminate()
-                except Exception:
-                    pass
-            self._reset()
-        return "Disconnected and released the Amesim license token."
+        if self._worker_proc:
+            try:
+                self._worker_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                # AMEPython.exe launches a child interpreter: stop its owned tree.
+                subprocess.run(["taskkill", "/PID", str(self._worker_proc.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=10)
+                self._worker_proc.wait(timeout=5)
+            self._worker_proc = None
+        if self._log:
+            self._log.close()
+            self._log = None
+        self._version = self._port = None
 
-    def _reset(self):
-        self._conn = None
-        self._worker_proc = None
-        self._version = None
-        self._port = None
+    @synchronized
+    def disconnect(self):
+        if self._conn:
+            try:
+                self.request("close")
+            except Exception:
+                pass
+        self._cleanup()
+        return "Disconnected; worker stopped."
 
-    def _spawn_worker(self, version: str, port: int):
-        version_dir = VERSION_DIRS[version]
-        ame_exe = os.path.join(version_dir, "win64", "AMEPython.exe")
-        if not os.path.isfile(ame_exe):
-            raise RuntimeError(f"AMEPython.exe not found for version {version}: {ame_exe}")
-        worker_entry_py = os.path.join(_PROJECT_ROOT, "amesim_mcp", "worker_entry.py")
-        if not os.path.isfile(worker_entry_py):
-            raise RuntimeError(f"worker_entry.py not found: {worker_entry_py}")
-
-        env = os.environ.copy()
-        env["AME"] = version_dir
-        for name in _MACHINE_ENV_FALLBACKS:
-            if not env.get(name):
-                value = _read_machine_env_var(name)
-                if value:
-                    env[name] = value
-        env["PATH"] = (
-            version_dir + os.pathsep
-            + os.path.join(version_dir, "win64") + os.pathsep
-            + os.path.join(version_dir, "win32") + os.pathsep
-            + env.get("PATH", "")
-        )
-        env["PYTHONPATH"] = _VENDOR_DIR + (
-            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
-        )
-
-        log = open(_WORKER_LOG, "w")
-        self._worker_proc = subprocess.Popen(
-            [ame_exe, "-s", worker_entry_py, str(port)],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            creationflags=subprocess.DETACHED_PROCESS,
-        )
-
-    # ---------- Escape hatch ----------
-
-    def execute_python(self, code: str) -> str:
-        if self._conn is None:
-            raise RuntimeError("Not connected to Simcenter Amesim. Call connect() first.")
-        remote_exec = self._conn.namespace["__mcp_exec"]
-        return remote_exec(code)
+    def execute_python(self, code):
+        if os.environ.get("AMESIM_MCP_ENABLE_EXECUTE_PYTHON") != "1":
+            raise PermissionError("execute_python is disabled")
+        return self.request("execute", code=code)

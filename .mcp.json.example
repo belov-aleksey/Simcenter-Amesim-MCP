@@ -1,9 +1,13 @@
 {
   "mcpServers": {
     "amesim": {
-      "command": "python",
+      "command": "C:/path/to/Simcenter-Amesim-MCP/.venv/Scripts/python.exe",
       "args": ["-m", "amesim_mcp.server"],
-      "cwd": "C:/path/to/amesim-mcp"
+      "cwd": "C:/path/to/Simcenter-Amesim-MCP",
+      "env": {
+        "AMESIM_HOME": "D:/Programs/Simcenter/2404/Amesim",
+        "AMESIM_MCP_ENABLE_EXECUTE_PYTHON": "0"
+      }
     }
   }
 }
